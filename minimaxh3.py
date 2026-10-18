@@ -37,11 +37,10 @@ custom prefix string, so the user can experiment.
 
 Memory
 ------
-Both safetensors files are opened with ``safetensors.safe_open`` (mmap
-backed). Tensors are read *one key at a time* and placed into the merged
-state dict, so peak RSS is the size of the merged dict (~one model's worth
-of tensor data) plus a few transient tensors -- the same ~19.5 GB the
-stock loader uses -- not 2x19.5 GB.
+Both safetensors files are loaded with ``comfy.utils.load_torch_file``, the
+same path the stock loader uses (mmap backed unless ``--disable-mmap``), and
+the merged state dict picks each key from one of them. The same file given
+as base and overlay is loaded once.
 
 This node does not mutate either safetensors file on disk; both files are
 opened read-only.
@@ -57,7 +56,6 @@ import re
 from typing import Callable
 
 import torch
-from safetensors import safe_open
 
 import comfy.sd
 import comfy.utils
@@ -164,17 +162,6 @@ PRESET_LIST = list(PRESETS.keys())
 # Core merging: build a state dict from two safetensors files
 # ---------------------------------------------------------------------------
 
-def _open_safetensors(path: str):
-    """Open a safetensors file read-only. Verify keys are present.
-
-    Returns (handle, keys_set)."""
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"MiniMax H3 hybrid loader: file not found: {path}")
-    f = safe_open(path, framework="pt", device="cpu")
-    keys = set(f.keys())
-    return f, keys
-
-
 def _expand_custom_overlay_globs(glob_csv: str | None) -> list[str]:
     """Parse the custom prefix / glob list. Supports both bare prefixes
     (e.g. ``blocks.3.``) and fnmatch globs (e.g. ``blocks.*.adaln_proj.``)."""
@@ -210,7 +197,7 @@ def build_hybrid_sd(
     overlay_path: str | None,
     overlay_groups: list[tuple[Callable[[str], bool], bool]],
 ) -> tuple[dict, dict]:
-    """Build a merged state dict and metadata by streaming tensors from disk.
+    """Build a merged state dict and metadata from two checkpoints.
 
     Parameters
     ----------
@@ -232,11 +219,8 @@ def build_hybrid_sd(
 
     Notes
     -----
-    * Both files are opened with ``safe_open`` (mmap, no RAM cost for the
-      19.5 GB weight data). Tensors are read one key at a time into the
-      returned dict, so peak RSS is one model's worth (~19.5 GB for the
-      minimax h3 int8 checkpoints) plus a couple of transient tensors --
-      the same as the stock ``load_torch_file`` loader.
+    * Both files are loaded with ``comfy.utils.load_torch_file``, the same
+      path as the stock loader, and each key is taken from one of them.
     * The ``.comfy_quant`` byte tensors (which encode the shared int8 quant
       format) are present in both checkpoints and bit-identical between
       them, so taking them from either file is equivalent; they always
@@ -252,8 +236,10 @@ def build_hybrid_sd(
     """
     if not overlay_path:
         overlay_path = base_path
-    base_f, base_keys = _open_safetensors(base_path)
-    overlay_f, overlay_keys = _open_safetensors(overlay_path)
+    base_sd = comfy.utils.load_torch_file(base_path)
+    overlay_sd = base_sd if overlay_path == base_path else comfy.utils.load_torch_file(overlay_path)
+    base_keys = set(base_sd)
+    overlay_keys = set(overlay_sd)
 
     # Validate identical key sets -- required for a clean merge. The
     # header JSON of both files is identical (per our analysis), so any key
@@ -303,8 +289,8 @@ def build_hybrid_sd(
                 parent = key[:-len("_scale")]
                 if is_overlay_key(parent + ".weight") or is_overlay_key(parent):
                     take_overlay = True
-        src = overlay_f if take_overlay else base_f
-        sd[key] = src.get_tensor(key)
+        src = overlay_sd if take_overlay else base_sd
+        sd[key] = src[key]
 
     metadata: dict = {}
     return sd, metadata
